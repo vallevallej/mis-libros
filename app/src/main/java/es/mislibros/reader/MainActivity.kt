@@ -159,15 +159,61 @@ private suspend fun readDocument(context: android.content.Context, uri: Uri): Re
 }
 
 private fun extractEpubText(bytes: ByteArray): String {
-    val entries = mutableListOf<Pair<String, String>>()
+    // Keep the EPUB entries in a map so the package document can define the
+    // actual reading order through its manifest and spine.
+    val entries = linkedMapOf<String, ByteArray>()
     ZipInputStream(ByteArrayInputStream(bytes)).use { zip ->
         while (true) {
             val entry = zip.nextEntry ?: break
-            if (!entry.isDirectory && (entry.name.endsWith(".xhtml") || entry.name.endsWith(".html") || entry.name.endsWith(".htm"))) {
-                entries += entry.name to zip.readBytes().toString(Charsets.UTF_8)
-            }
+            if (!entry.isDirectory) entries[entry.name] = zip.readBytes()
             zip.closeEntry()
         }
     }
-    return entries.sortedBy { it.first }.joinToString("\n\n") { Jsoup.parse(it.second).text() }
+
+    fun normalizeArchivePath(path: String): String {
+        val parts = mutableListOf<String>()
+        path.split('/').forEach { part ->
+            when (part) {
+                "", "." -> Unit
+                ".." -> if (parts.isNotEmpty()) parts.removeAt(parts.lastIndex)
+                else -> parts += part
+            }
+        }
+        return parts.joinToString("/")
+    }
+
+    val containerBytes = entries["META-INF/container.xml"]
+    val opfPath = containerBytes?.let { container ->
+        org.jsoup.Jsoup.parse(container.toString(Charsets.UTF_8), "", org.jsoup.parser.Parser.xmlParser())
+            .getElementsByTag("rootfile").firstOrNull()?.attr("full-path")
+    }.orEmpty()
+
+    val orderedPaths = if (opfPath.isNotBlank()) {
+        val opfBytes = entries[opfPath]
+        if (opfBytes != null) {
+            val opf = org.jsoup.Jsoup.parse(opfBytes.toString(Charsets.UTF_8), "", org.jsoup.parser.Parser.xmlParser())
+            val manifest = opf.getElementsByTag("item").associate { item ->
+                item.attr("id") to item.attr("href")
+            }
+            val opfDirectory = opfPath.substringBeforeLast('/', "")
+            opf.getElementsByTag("itemref").mapNotNull { itemRef ->
+                val href = manifest[itemRef.attr("idref")].orEmpty()
+                if (href.isBlank()) return@mapNotNull null
+                val decodedHref = runCatching {
+                    java.net.URLDecoder.decode(href.substringBefore('#').substringBefore('?'), "UTF-8")
+                }.getOrDefault(href.substringBefore('#').substringBefore('?'))
+                normalizeArchivePath(if (opfDirectory.isBlank()) decodedHref else "$opfDirectory/$decodedHref")
+            }.filter { entries.containsKey(it) }
+        } else emptyList()
+    } else emptyList()
+
+    // Some malformed EPUBs omit a usable package document. Retain a
+    // deterministic fallback rather than failing to open those books.
+    val htmlPaths = if (orderedPaths.isNotEmpty()) orderedPaths else entries.keys
+        .filter { it.endsWith(".xhtml", true) || it.endsWith(".html", true) || it.endsWith(".htm", true) }
+        .sorted()
+
+    return htmlPaths.joinToString("\n\n") { path ->
+        Jsoup.parse(entries.getValue(path).toString(Charsets.UTF_8)).text()
+    }
 }
