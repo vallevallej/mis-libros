@@ -22,9 +22,9 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
 import androidx.lifecycle.lifecycleScope
 import java.io.File
-import org.apache.pdfbox.android.PDFBoxResourceLoader
-import org.apache.pdfbox.pdmodel.PDDocument
-import org.apache.pdfbox.text.PDFTextStripper
+import org.tom_roush.pdfbox.android.PDFBoxResourceLoader
+import org.tom_roush.pdfbox.pdmodel.PDDocument
+import org.tom_roush.pdfbox.text.PDFTextStripper
 import org.jsoup.Jsoup
 import java.util.zip.ZipInputStream
 import java.io.ByteArrayInputStream
