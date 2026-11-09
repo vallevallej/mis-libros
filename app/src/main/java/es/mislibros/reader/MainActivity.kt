@@ -3,8 +3,6 @@ package es.mislibros.reader
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -22,55 +20,69 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
+import androidx.lifecycle.lifecycleScope
+import java.io.File
 import org.apache.pdfbox.android.PDFBoxResourceLoader
 import org.apache.pdfbox.pdmodel.PDDocument
 import org.apache.pdfbox.text.PDFTextStripper
 import org.jsoup.Jsoup
-import java.util.Locale
-import java.util.UUID
 import java.util.zip.ZipInputStream
 import java.io.ByteArrayInputStream
 
-class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
-    private var tts: TextToSpeech? = null
-    private var ready = false
-    private var pendingText: String? = null
-
+class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         PDFBoxResourceLoader.init(applicationContext)
-        tts = TextToSpeech(this, this)
-        setContent { MisLibrosScreen({ text, rate -> speak(text, rate) }, ::stopReading, ::openTtsSettings) }
-    }
-
-    override fun onInit(status: Int) {
-        ready = status == TextToSpeech.SUCCESS
-        if (ready) {
-            tts?.language = Locale("es", "ES")
-            pendingText?.let { speak(it); pendingText = null }
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 4102)
+        }
+        setContent {
+            MisLibrosScreen(
+                onSpeak = { text, rate ->
+                    lifecycleScope.launch {
+                        // Avoid Android Binder's small transaction limit for full novels.
+                        val path = withContext(Dispatchers.IO) {
+                            File(cacheDir, "current_reading.txt").apply { writeText(text, Charsets.UTF_8) }.absolutePath
+                        }
+                        val intent = Intent(this@MainActivity, ReadingService::class.java).apply {
+                            action = ReadingService.ACTION_PLAY
+                            putExtra(ReadingService.EXTRA_FILE_PATH, path)
+                            putExtra(ReadingService.EXTRA_RATE, rate)
+                        }
+                        androidx.core.content.ContextCompat.startForegroundService(this@MainActivity, intent)
+                    }
+                },
+                onStop = {
+                    startService(Intent(this, ReadingService::class.java).setAction(ReadingService.ACTION_STOP))
+                },
+                onVoiceSettings = ::openTtsSettings,
+                onPause = {
+                    startService(Intent(this, ReadingService::class.java).setAction(ReadingService.ACTION_PAUSE))
+                },
+                onResume = {
+                    startService(Intent(this, ReadingService::class.java).setAction(ReadingService.ACTION_RESUME))
+                }
+            )
         }
     }
 
-    private fun speak(text: String, rate: Float = 1.0f) {
-        if (!ready) { pendingText = text; return }
-        val engine = tts ?: return
-        engine.stop()
-        engine.setSpeechRate(rate)
-        val chunks = text.chunked(2800)
-        chunks.forEachIndexed { index, chunk ->
-            engine.speak(chunk, if (index == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD,
-                Bundle(), "mislibros-${UUID.randomUUID()}")
-        }
+    private fun openTtsSettings() {
+        val intent = Intent("com.android.settings.TTS_SETTINGS")
+        startActivity(if (intent.resolveActivity(packageManager) != null) intent else Intent(Settings.ACTION_SETTINGS))
     }
-
-    private fun stopReading() { tts?.stop() }
-    private fun openTtsSettings() { startActivity(Intent("com.android.settings.TTS_SETTINGS").takeIf { it.resolveActivity(packageManager) != null } ?: Intent(Settings.ACTION_SETTINGS)) }
-    override fun onDestroy() { tts?.stop(); tts?.shutdown(); super.onDestroy() }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun MisLibrosScreen(onSpeak: (String, Float) -> Unit, onStop: () -> Unit, onVoiceSettings: () -> Unit) {
+private fun MisLibrosScreen(
+    onSpeak: (String, Float) -> Unit,
+    onStop: () -> Unit,
+    onVoiceSettings: () -> Unit,
+    onPause: () -> Unit,
+    onResume: () -> Unit
+) {
     val context = LocalContext.current
     var title by remember { mutableStateOf("Todavía no has abierto ningún libro") }
     var text by remember { mutableStateOf("") }
@@ -109,9 +121,15 @@ private fun MisLibrosScreen(onSpeak: (String, Float) -> Unit, onStop: () -> Unit
                     if (text.isNotBlank()) {
                         Text("Velocidad: ${"%.1f".format(speed)}x")
                         Slider(value = speed, onValueChange = { speed = it }, valueRange = 0.7f..1.4f)
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(onClick = { onSpeak(text, speed) }, modifier = Modifier.weight(1f)) { Text("▶ Escuchar") }
-                            OutlinedButton(onClick = onStop) { Text("Detener") }
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(onClick = { onSpeak(text, speed) }, modifier = Modifier.weight(1f)) { Text("▶ Escuchar") }
+                                OutlinedButton(onClick = onPause, modifier = Modifier.weight(1f)) { Text("Pausar") }
+                            }
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(onClick = onResume, modifier = Modifier.weight(1f)) { Text("Continuar") }
+                                OutlinedButton(onClick = onStop, modifier = Modifier.weight(1f)) { Text("Detener") }
+                            }
                         }
                         Text("Vista previa", fontWeight = FontWeight.SemiBold)
                         Text(text.take(1200), style = MaterialTheme.typography.bodyMedium)
@@ -120,7 +138,7 @@ private fun MisLibrosScreen(onSpeak: (String, Float) -> Unit, onStop: () -> Unit
                     }
                 }
             }
-            Text("Consejo: para una voz neuronal, instala un motor TTS compatible (por ejemplo, HayaiTTS) y selecciónalo en los ajustes de voz de Android.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("La voz utilizada depende del motor de Texto a voz seleccionado en los ajustes de Android. Puedes cambiarlo desde «Voces».", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
